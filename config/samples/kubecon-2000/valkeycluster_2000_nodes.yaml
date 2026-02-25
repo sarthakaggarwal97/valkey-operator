@@ -1,0 +1,61 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeyCluster
+metadata:
+  name: kubecon-2000
+  namespace: valkey-kubecon
+spec:
+  # 1000 shards * (1 primary + 1 replica) = 2000 nodes.
+  shards: 1000
+  replicas: 1
+
+  # Keep requests conservative for large pod counts; tune for your hardware.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+  # Use only one metrics sidecar to avoid duplicate exporter overhead.
+  exporter:
+    enabled: false
+
+  clusterConfig:
+    # 15-30s is recommended at very large node counts.
+    clusterNodeTimeoutMs: 20000
+    # Demo-only tuning directives appended to valkey.conf.
+    # These lines intentionally favor benchmarking over production safety.
+    additionalConfig:
+    - enable-debug-command yes
+    - cluster-require-full-coverage no
+    - cluster-allow-reads-when-down yes
+    - save ""
+    - io-threads 6
+    - maxclients 1048544
+    - appendonly no
+    - maxmemory 50gb
+    - lazyfree-lazy-eviction yes
+    - repl-backlog-size 1gb
+    - activerehashing yes
+    - prefetch-batch-max-size 64
+    - tcp-backlog 65000
+    - timeout 0
+
+  admission:
+    # Max allowed by CRD; reduces bootstrap wall-clock time.
+    parallelism: 200
+    meetStrategy: seed
+    seedCount: 10
+
+  zoneAwareness:
+    enabled: true
+    topologyKey: topology.kubernetes.io/zone
+    maxSkew: 1
+
+  metrics:
+    enabled: true
+    # 5s gives good resolution with materially less scrape pressure than 1s.
+    scrapeIntervalSec: 5
+    highResolution: false
+    aggregatorReplicas: 2

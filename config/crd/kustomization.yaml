@@ -3,6 +3,8 @@
 # It should be run by config/default
 resources:
 - bases/valkey.io_valkeyclusters.yaml
+- bases/valkey.io_valkeybenchmarks.yaml
+- bases/valkey.io_valkeydisruptions.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

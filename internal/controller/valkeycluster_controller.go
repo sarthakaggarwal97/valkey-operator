@@ -20,16 +20,20 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,7 +71,10 @@ var scripts embed.FS
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="policy",resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=prometheusrules,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is the main reconciliation loop. On each invocation it drives the
 // cluster one step closer to the desired state described by the ValkeyCluster
@@ -82,8 +89,9 @@ var scripts embed.FS
 //     node and scraping CLUSTER INFO / CLUSTER NODES.
 //  5. Forget stale nodes that no longer have a backing pod.
 //  6. For every pending node (primary with no slots and cluster_known_nodes
-//     <= 1), introduce it to the cluster. Only one pending node is processed
-//     per reconcile to allow gossip to propagate before the next step.
+//     <= 1), admit nodes in parallel batches using the AdmissionManager.
+//     Primaries are admitted before replicas. The SeedMeetStrategy controls
+//     how new nodes discover the cluster (seed-based or all-primaries).
 //  7. Verify that the expected number of shards and replicas exist.
 //  8. Verify that all 16384 hash slots are assigned.
 //  9. If everything is healthy, mark the cluster Ready and requeue after 30s
@@ -99,6 +107,11 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	// Apply safe large-scale defaults for any omitted config fields and
+	// emit warning events for potentially dangerous configurations.
+	ApplyClusterDefaults(&cluster.Spec)
+	EmitConfigWarnings(r.Recorder, cluster)
 
 	if err := r.upsertService(ctx, cluster); err != nil {
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonServiceError, err.Error(), metav1.ConditionFalse)
@@ -118,6 +131,22 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// Ensure per-shard PodDisruptionBudgets exist when zone awareness is
+	// enabled. PDBs are created after deployments so that the pods they
+	// protect already exist (or are being created).
+	if err := r.upsertPDBs(ctx, cluster); err != nil {
+		log.Error(err, "failed to upsert PDBs")
+		return ctrl.Result{}, err
+	}
+
+	// Ensure Prometheus ServiceMonitor and PrometheusRule resources exist
+	// when metrics.enabled is true. These are created as unstructured objects
+	// and degrade gracefully if the Prometheus Operator CRDs are not installed.
+	if err := r.reconcileObservability(ctx, cluster); err != nil {
+		log.Error(err, "failed to reconcile observability resources")
+		// Non-fatal: observability is optional, continue reconciliation.
+	}
+
 	// Get all pods and their current Valkey Cluster state
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(labels(cluster))); err != nil {
@@ -129,37 +158,85 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	state := r.getValkeyClusterState(ctx, pods)
 	defer state.CloseClients()
 
+	// Check zone spread when zone awareness is enabled. This emits a warning
+	// event and sets ZoneSpreadDegraded=True if zones < replicas + 1.
+	ApplyZoneDefaults(&cluster.Spec)
+	checkZoneSpread(r.Recorder, cluster, pods)
+
 	// Check if we need to forget stale non-existing nodes
 	r.forgetStaleNodes(ctx, cluster, state, pods)
 
-	// Process one pending node per reconcile. A "pending" node is a Valkey
-	// node with no slots assigned (see clusterstate.go). We handle only one at
-	// a time so that gossip has a chance to propagate the topology change to
-	// all members before the next node is introduced. After addValkeyNode
-	// returns, we requeue after 2 seconds.
-	//
-	// We prioritize node-index 0 (primary) over higher indices (replicas).
-	// This is important because replicateToShardPrimary needs the primary
-	// to already be in state.Shards (i.e. have slots assigned). If we
-	// processed a replica first, its primary might still be in PendingNodes
-	// and the lookup would fail.
+	// Process pending nodes in batches using the AdmissionManager. Nodes are
+	// admitted in parallel up to the configured parallelism, with primaries
+	// processed before replicas. The SeedMeetStrategy controls how new nodes
+	// discover the cluster: "seed" MEETs a small seed set, "all" MEETs every
+	// primary (legacy behavior).
 	if len(state.PendingNodes) > 0 {
-		node := pickPendingNode(state.PendingNodes, pods)
-		log.V(1).Info("adding node", "address", node.Address, "Id", node.Id)
-		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "NodeAdding", "AddNode", "Adding node %v to cluster", node.Address)
+		log.V(1).Info("processing pending nodes", "count", len(state.PendingNodes))
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "BatchAdmission", "AddNodes",
+			"Admitting up to %d of %d pending nodes", cluster.Spec.Admission.Parallelism, len(state.PendingNodes))
 		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonAddingNodes, "Adding nodes to cluster", metav1.ConditionTrue)
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
 		setCondition(cluster, valkeyiov1alpha1.ConditionSlotsAssigned, valkeyiov1alpha1.ReasonSlotsUnassigned, "Assigning slots to nodes", metav1.ConditionFalse)
 		_ = r.updateStatus(ctx, cluster, state)
-		if err := r.addValkeyNode(ctx, cluster, state, node, pods); err != nil {
-			log.Error(err, "unable to add cluster node")
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "NodeAddFailed", "AddNode", "Failed to add node: %v", err)
+
+		// Initialize SeedMeetStrategy based on admission config.
+		seedStrategy := r.newSeedMeetStrategy(cluster, state)
+
+		am := valkey.NewAdmissionManager(*cluster.Spec.Admission, seedStrategy)
+		slotTracker := valkey.NewSlotTracker(state.GetUnassignedSlots())
+		existingShards := len(state.Shards)
+		assignedPrimaries := 0
+
+		// Wire callbacks to existing controller methods.
+		assignSlots := func(ctx context.Context, node *valkey.NodeState) error {
+			slotRange, err := nextSlotRangeForPrimary(cluster, slotTracker, existingShards, assignedPrimaries)
+			if err != nil {
+				return err
+			}
+			if err := r.assignSlotsRangeToPrimary(ctx, cluster, node, slotRange); err != nil {
+				return err
+			}
+			if err := slotTracker.Assign(slotRange); err != nil {
+				return err
+			}
+			assignedPrimaries++
+			return nil
+		}
+		attachReplica := func(ctx context.Context, node *valkey.NodeState, primaryID string) error {
+			return node.Client.Do(ctx, node.Client.B().ClusterReplicate().NodeId(primaryID).Build()).Error()
+		}
+
+		batchResult, err := am.ProcessPendingNodes(
+			ctx, state, pods, cluster,
+			assignSlots,
+			attachReplica,
+			findShardPrimary,
+			podRoleAndShard,
+			shardExistsInTopology,
+		)
+		if err != nil {
+			log.Error(err, "batch admission failed")
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "BatchAdmissionFailed", "AddNodes",
+				"Batch admission failed: %v", err)
 			setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonNodeAddFailed, err.Error(), metav1.ConditionTrue)
 			_ = r.updateStatus(ctx, cluster, state)
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
-		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "NodeAdded", "AddNode", "Node %v joined cluster", node.Address)
-		// Let the added node stabilize, and refetch the cluster state.
+
+		if len(batchResult.Failed) > 0 {
+			for _, f := range batchResult.Failed {
+				log.Error(f.Err, "node admission failed", "address", f.NodeAddress)
+			}
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "BatchAdmissionPartial", "AddNodes",
+				"Admitted %d nodes, %d failed", batchResult.Admitted, len(batchResult.Failed))
+		} else {
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "BatchAdmissionComplete", "AddNodes",
+				"Admitted %d nodes in %v (gossip convergence: %v)",
+				batchResult.Admitted, batchResult.Duration, batchResult.GossipConvergence)
+		}
+
+		// Requeue to process remaining pending nodes or verify cluster state.
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
@@ -198,6 +275,41 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
+	// Detect shard count changes and trigger resharding. This only runs when
+	// the cluster is already formed (all slots assigned) — not during initial
+	// bootstrap when shards are still being created. Scale-in moves slots from
+	// removed shards to remaining ones; scale-out redistributes slots after
+	// new primaries have been admitted.
+	if int(cluster.Spec.Shards) != len(state.Shards) {
+		log.Info("shard count changed, triggering resharding",
+			"currentShards", len(state.Shards),
+			"desiredShards", cluster.Spec.Shards)
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReshardingStarted", "Reshard",
+			"Resharding from %d to %d shards", len(state.Shards), cluster.Spec.Shards)
+
+		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling,
+			"Resharding in progress", metav1.ConditionFalse)
+		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonReconciling,
+			fmt.Sprintf("Resharding from %d to %d shards", len(state.Shards), cluster.Spec.Shards), metav1.ConditionTrue)
+		_ = r.updateStatus(ctx, cluster, state)
+
+		rc := valkey.NewReshardController(r.Client, r.Recorder)
+		if err := rc.ReshardCluster(ctx, state, cluster); err != nil {
+			log.Error(err, "resharding failed")
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ReshardingFailed", "Reshard",
+				"Resharding failed: %v", err)
+			setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkey.ReasonReshardFailed,
+				fmt.Sprintf("Resharding failed: %v", err), metav1.ConditionTrue)
+			_ = r.updateStatus(ctx, cluster, state)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReshardingComplete", "Reshard",
+			"Successfully resharded from %d to %d shards", len(state.Shards), cluster.Spec.Shards)
+		// Requeue to re-evaluate cluster state after resharding.
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
 	// Check that all replicas have their replication link up (master_link_status:up).
 	// before marking the cluster Ready, we need to make sure all replicas are in sync with their primary.
 	for _, shard := range state.Shards {
@@ -229,8 +341,39 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
+// newSeedMeetStrategy creates a SeedMeetStrategy based on the cluster's
+// admission config. For "seed" strategy, uses the configured seedCount.
+// For "all" strategy, sets seedCount to the total number of primaries so
+// that every primary is used as a seed (legacy behavior).
+func (r *ValkeyClusterReconciler) newSeedMeetStrategy(cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState) *valkey.SeedMeetStrategy {
+	seedCount := int(cluster.Spec.Admission.SeedCount)
+	if cluster.Spec.Admission.MeetStrategy == "all" {
+		// "all" strategy: MEET every primary by setting seedCount to total primaries.
+		totalPrimaries := len(state.Shards)
+		if totalPrimaries > 0 {
+			seedCount = totalPrimaries
+		}
+	}
+	return valkey.NewSeedMeetStrategy(seedCount)
+}
+
 // Create or update a headless service (client connects to pods directly)
 func (r *ValkeyClusterReconciler) upsertService(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster) error {
+	servicePorts := []corev1.ServicePort{
+		{
+			Name:       "valkey",
+			Port:       DefaultPort,
+			TargetPort: intstr.FromString("client"),
+		},
+	}
+	if cluster.Spec.Metrics != nil && cluster.Spec.Metrics.Enabled {
+		servicePorts = append(servicePorts, corev1.ServicePort{
+			Name:       "metrics-sidecar",
+			Port:       DefaultMetricsSidecarPort,
+			TargetPort: intstr.FromString("metrics-sidecar"),
+		})
+	}
+
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name,
@@ -241,12 +384,7 @@ func (r *ValkeyClusterReconciler) upsertService(ctx context.Context, cluster *va
 			Type:      corev1.ServiceTypeClusterIP,
 			ClusterIP: "None",
 			Selector:  labels(cluster),
-			Ports: []corev1.ServicePort{
-				{
-					Name: "valkey",
-					Port: DefaultPort,
-				},
-			},
+			Ports:     servicePorts,
 		},
 	}
 	if err := controllerutil.SetControllerReference(cluster, svc, r.Scheme); err != nil {
@@ -265,6 +403,29 @@ func (r *ValkeyClusterReconciler) upsertService(ctx context.Context, cluster *va
 		r.Recorder.Eventf(cluster, svc, corev1.EventTypeNormal, "ServiceCreated", "CreateService", "Created headless Service")
 	}
 	return nil
+}
+
+// buildValkeyConfig renders valkey.conf content from the cluster spec.
+// Base directives are always set by the operator; AdditionalConfig is appended
+// after base directives so users can override values for benchmarking.
+func buildValkeyConfig(cluster *valkeyiov1alpha1.ValkeyCluster) string {
+	lines := []string{
+		"port 6379",
+		"cluster-enabled yes",
+		"cluster-config-file nodes.conf",
+		"protected-mode no",
+		"cluster-node-timeout " + strconv.FormatInt(int64(cluster.Spec.ClusterConfig.ClusterNodeTimeoutMs), 10),
+	}
+
+	for _, raw := range cluster.Spec.ClusterConfig.AdditionalConfig {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 // Create or update a basic valkey.conf
@@ -287,10 +448,7 @@ func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *
 		Data: map[string]string{
 			"readiness-check.sh": string(readiness),
 			"liveness-check.sh":  string(liveness),
-			"valkey.conf": `
-cluster-enabled yes
-protected-mode no
-cluster-node-timeout 2000`,
+			"valkey.conf":        buildValkeyConfig(cluster),
 		},
 	}
 	if err := controllerutil.SetControllerReference(cluster, cm, r.Scheme); err != nil {
@@ -346,6 +504,67 @@ func (r *ValkeyClusterReconciler) upsertDeployments(ctx context.Context, cluster
 	}
 
 	// TODO: update existing Deployments when the spec changes (e.g. image upgrade).
+
+	return nil
+}
+
+// upsertPDBs ensures one PodDisruptionBudget per shard exists when zone
+// awareness is enabled. Each PDB has minAvailable=1 so that at least one
+// pod per shard survives voluntary disruptions. Stale PDBs (from a previous
+// higher shard count) are cleaned up.
+func (r *ValkeyClusterReconciler) upsertPDBs(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster) error {
+	zone := cluster.Spec.ZoneAwareness
+	if zone == nil || !zone.Enabled {
+		return nil
+	}
+
+	log := logf.FromContext(ctx)
+
+	// Create or update a PDB for each shard.
+	for shard := range int(cluster.Spec.Shards) {
+		pdb := createShardPDB(cluster, shard)
+		if err := controllerutil.SetControllerReference(cluster, pdb, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.Create(ctx, pdb); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				continue
+			}
+			return fmt.Errorf("failed to create PDB for shard %d: %w", shard, err)
+		}
+		log.V(1).Info("created PDB", "name", pdb.Name, "shard", shard)
+	}
+
+	// Clean up stale PDBs when shard count decreases. List all PDBs owned
+	// by this cluster and delete any whose shard index >= current shard count.
+	pdbList := &policyv1.PodDisruptionBudgetList{}
+	if err := r.List(ctx, pdbList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/instance":   cluster.Name,
+			"app.kubernetes.io/managed-by": "valkey-operator",
+		},
+	); err != nil {
+		return fmt.Errorf("failed to list PDBs: %w", err)
+	}
+
+	for i := range pdbList.Items {
+		pdb := &pdbList.Items[i]
+		shardStr, ok := pdb.Labels[LabelShardIndex]
+		if !ok {
+			continue
+		}
+		shardIdx, err := strconv.Atoi(shardStr)
+		if err != nil {
+			continue
+		}
+		if shardIdx >= int(cluster.Spec.Shards) {
+			if err := r.Delete(ctx, pdb); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete stale PDB %s: %w", pdb.Name, err)
+			}
+			log.V(1).Info("deleted stale PDB", "name", pdb.Name, "shard", shardIdx)
+		}
+	}
 
 	return nil
 }
@@ -458,49 +677,99 @@ func (r *ValkeyClusterReconciler) addValkeyNode(ctx context.Context, cluster *va
 	return errors.New("cannot determine node role from pod name")
 }
 
-// assignSlotsToNewPrimary assigns the next available hash-slot range to a
-// node, promoting it to a slot-bearing primary.
-//
-// Slot range calculation:
-//
-//	Each shard gets TotalSlots/shardsRequired slots (integer division).
-//	The last shard absorbs any remainder so that exactly 16384 slots are
-//	covered. For example, with 3 shards: shard 0 gets 0-5460, shard 1 gets
-//	5461-10921, and shard 2 gets 10922-16383.
-//
-// We only assign a contiguous range from the first unassigned gap. The last
-// shard is special-cased: if it is the final shard to create, it takes
-// everything that remains (slots[0].End) to avoid rounding issues.
+// assignSlotsToNewPrimary computes the next slot range for a single new primary
+// from the current cluster snapshot and assigns it.
 func (r *ValkeyClusterReconciler) assignSlotsToNewPrimary(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState, node *valkey.NodeState) error {
-	log := logf.FromContext(ctx)
-	shardsRequired := int(cluster.Spec.Shards)
-	shardsExists := len(state.Shards)
+	slotTracker := valkey.NewSlotTracker(state.GetUnassignedSlots())
+	slotRange, err := nextSlotRangeForPrimary(cluster, slotTracker, len(state.Shards), 0)
+	if err != nil {
+		setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonNoSlots, err.Error(), metav1.ConditionTrue)
+		return err
+	}
+	return r.assignSlotsRangeToPrimary(ctx, cluster, node, slotRange)
+}
 
-	slots := state.GetUnassignedSlots()
-	if len(slots) == 0 {
-		log.Error(nil, "no unassigned slots available for new shard")
-		setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonNoSlots, "No unassigned slots available for new shard", metav1.ConditionTrue)
-		return errors.New("no slots range to assign")
+// nextSlotRangeForPrimary computes the next slot range for a new primary during
+// admission, given the current slot tracker and how many primaries have already
+// been assigned in the current batch.
+func nextSlotRangeForPrimary(
+	cluster *valkeyiov1alpha1.ValkeyCluster,
+	slotTracker *valkey.SlotTracker,
+	existingShards int,
+	assignedPrimaries int,
+) (valkey.SlotsRange, error) {
+	remaining := slotTracker.Remaining()
+	if len(remaining) == 0 {
+		return valkey.SlotsRange{}, errors.New("no unassigned slots available for new shard")
 	}
 
-	// Compute the slot range for this shard.
-	slotStart := slots[0].Start
-	slotEnd := slotStart + (valkey.TotalSlots / shardsRequired) - 1
-	if shardsRequired-shardsExists == 1 {
-		// Last shard: absorb remaining slots to cover all 16384.
-		if len(slots) != 1 {
-			return errors.New("assigning multiple ranges to shard not yet supported")
+	desiredShards := int(cluster.Spec.Shards)
+	if desiredShards < 1 {
+		return valkey.SlotsRange{}, fmt.Errorf("invalid desired shard count: %d", desiredShards)
+	}
+
+	remainingNewShards := desiredShards - (existingShards + assignedPrimaries)
+	if remainingNewShards <= 0 {
+		return valkey.SlotsRange{}, fmt.Errorf(
+			"no additional shard slots required (desired=%d existing=%d assigned=%d)",
+			desiredShards, existingShards, assignedPrimaries,
+		)
+	}
+
+	// Last shard absorbs the remaining slots so all 16384 slots are covered.
+	if remainingNewShards == 1 {
+		if len(remaining) != 1 {
+			return valkey.SlotsRange{}, errors.New("assigning multiple slot ranges to one shard is not supported")
 		}
-		slotEnd = slots[0].End
+		return remaining[0], nil
 	}
 
-	log.V(1).Info("add a new primary", "slotStart", slotStart, "slotEnd", slotEnd)
-	if err := node.Client.Do(ctx, node.Client.B().ClusterAddslotsrange().StartSlotEndSlot().StartSlotEndSlot(int64(slotStart), int64(slotEnd)).Build()).Error(); err != nil {
-		log.Error(err, "command failed: CLUSTER ADDSLOTSRANGE", "slotStart", slotStart, "slotEnd", slotEnd)
+	slotsPerShard := valkey.TotalSlots / desiredShards
+	first := remaining[0]
+	if first.End-first.Start+1 < slotsPerShard {
+		return valkey.SlotsRange{}, fmt.Errorf(
+			"first unassigned slot range %d-%d too small for shard size %d",
+			first.Start, first.End, slotsPerShard,
+		)
+	}
+
+	return valkey.SlotsRange{
+		Start: first.Start,
+		End:   first.Start + slotsPerShard - 1,
+	}, nil
+}
+
+// assignSlotsRangeToPrimary executes CLUSTER ADDSLOTSRANGE for a specific slot
+// range on a target primary node.
+func (r *ValkeyClusterReconciler) assignSlotsRangeToPrimary(
+	ctx context.Context,
+	cluster *valkeyiov1alpha1.ValkeyCluster,
+	node *valkey.NodeState,
+	slotRange valkey.SlotsRange,
+) error {
+	log := logf.FromContext(ctx)
+	log.V(1).Info("assigning slot range to new primary",
+		"node", node.Address,
+		"slotStart", slotRange.Start,
+		"slotEnd", slotRange.End,
+	)
+
+	if err := node.Client.Do(
+		ctx,
+		node.Client.B().ClusterAddslotsrange().
+			StartSlotEndSlot().
+			StartSlotEndSlot(int64(slotRange.Start), int64(slotRange.End)).
+			Build(),
+	).Error(); err != nil {
+		log.Error(err, "command failed: CLUSTER ADDSLOTSRANGE",
+			"slotStart", slotRange.Start,
+			"slotEnd", slotRange.End,
+		)
 		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "SlotAssignmentFailed", "AssignSlots", "Failed to assign slots: %v", err)
 		return err
 	}
-	r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "PrimaryCreated", "CreatePrimary", "Created primary with slots %d-%d", slotStart, slotEnd)
+
+	r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "PrimaryCreated", "CreatePrimary", "Created primary with slots %d-%d", slotRange.Start, slotRange.End)
 	return nil
 }
 
@@ -644,6 +913,7 @@ func (r *ValkeyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Named("valkeycluster").
 		Complete(r)
 }

@@ -1,0 +1,14 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeyDisruption
+metadata:
+  name: kubecon-failover-25-primaries
+  namespace: valkey-kubecon
+spec:
+  clusterRef: kubecon-2000
+  action: Failover
+  selector:
+    role: primary
+    shardRange:
+      start: 50
+      end: 74
+    count: 25

@@ -22,10 +22,12 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -270,6 +272,7 @@ var _ = Describe("EventRecorder", func() {
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, cluster) }()
 
+			ApplyClusterDefaults(&cluster.Spec)
 			err := r.upsertConfigMap(ctx, cluster)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -277,6 +280,68 @@ var _ = Describe("EventRecorder", func() {
 			Expect(events).To(ContainElement(ContainSubstring("ConfigMapCreated")))
 			Expect(events).To(ContainElement(ContainSubstring("Normal")))
 			Expect(events).To(ContainElement(ContainSubstring("Created ConfigMap with configuration")))
+
+			// Verify the ConfigMap contains the correct cluster-node-timeout from ClusterConfig
+			var cm corev1.ConfigMap
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &cm)).To(Succeed())
+			Expect(cm.Data["valkey.conf"]).To(ContainSubstring("cluster-node-timeout 15000"))
+		})
+
+		It("should write custom clusterNodeTimeoutMs into valkey.conf ConfigMap", func() {
+			cluster := &valkeyiov1alpha1.ValkeyCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "custom-timeout-cluster",
+					Namespace: "default",
+				},
+				Spec: valkeyiov1alpha1.ValkeyClusterSpec{
+					Shards:   3,
+					Replicas: 1,
+					ClusterConfig: &valkeyiov1alpha1.ClusterConfig{
+						ClusterNodeTimeoutMs: 30000,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, cluster) }()
+
+			ApplyClusterDefaults(&cluster.Spec)
+			err := r.upsertConfigMap(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+
+			var cm corev1.ConfigMap
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &cm)).To(Succeed())
+			Expect(cm.Data["valkey.conf"]).To(ContainSubstring("cluster-node-timeout 30000"))
+		})
+
+		It("should append additionalConfig directives into valkey.conf ConfigMap", func() {
+			cluster := &valkeyiov1alpha1.ValkeyCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "additional-config-cluster",
+					Namespace: "default",
+				},
+				Spec: valkeyiov1alpha1.ValkeyClusterSpec{
+					Shards:   3,
+					Replicas: 1,
+					ClusterConfig: &valkeyiov1alpha1.ClusterConfig{
+						ClusterNodeTimeoutMs: 30000,
+						AdditionalConfig: []string{
+							"save \"\"",
+							"maxmemory 50gb",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, cluster) }()
+
+			ApplyClusterDefaults(&cluster.Spec)
+			err := r.upsertConfigMap(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+
+			var cm corev1.ConfigMap
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &cm)).To(Succeed())
+			Expect(cm.Data["valkey.conf"]).To(ContainSubstring("save \"\""))
+			Expect(cm.Data["valkey.conf"]).To(ContainSubstring("maxmemory 50gb"))
 		})
 
 		It("should emit DeploymentCreated event on successful deployment creation", func() {

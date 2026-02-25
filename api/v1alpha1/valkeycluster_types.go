@@ -73,6 +73,23 @@ type ValkeyClusterSpec struct {
 	// +kubebuilder:default:={enabled:true}
 	// +optional
 	Exporter ExporterSpec `json:"exporter,omitempty"`
+
+	// ClusterConfig holds tunable Valkey cluster parameters.
+	// If omitted, safe large-scale defaults are applied.
+	// +optional
+	ClusterConfig *ClusterConfig `json:"clusterConfig,omitempty"`
+
+	// Admission controls how new nodes are introduced to the cluster.
+	// +optional
+	Admission *AdmissionConfig `json:"admission,omitempty"`
+
+	// ZoneAwareness controls zone-aware placement behavior.
+	// +optional
+	ZoneAwareness *ZoneConfig `json:"zoneAwareness,omitempty"`
+
+	// Metrics controls the observability pipeline for the ValkeyCluster.
+	// +optional
+	Metrics *MetricsConfig `json:"metrics,omitempty"`
 }
 
 type ExporterSpec struct {
@@ -86,6 +103,99 @@ type ExporterSpec struct {
 
 	// Enable or disable the exporter sidecar container
 	Enabled bool `json:"enabled,omitempty"`
+}
+
+// ClusterConfig holds tunable Valkey cluster parameters.
+// These are written into the generated valkey.conf ConfigMap.
+type ClusterConfig struct {
+	// ClusterNodeTimeoutMs is the cluster-node-timeout in milliseconds.
+	// At 2000 nodes, the default 2000ms is too aggressive; 15000-30000ms is recommended.
+	// +kubebuilder:validation:Minimum=1000
+	// +kubebuilder:validation:Maximum=60000
+	// +kubebuilder:default=15000
+	// +optional
+	ClusterNodeTimeoutMs int32 `json:"clusterNodeTimeoutMs,omitempty"`
+
+	// AdditionalConfig appends raw valkey.conf directives after operator-managed
+	// base directives (port, cluster-enabled, protected-mode, cluster-node-timeout).
+	// Later directives win when duplicated, so this can be used to override base
+	// values for non-production benchmarking.
+	// +optional
+	AdditionalConfig []string `json:"additionalConfig,omitempty"`
+}
+
+// AdmissionConfig controls how new nodes are introduced to the cluster.
+type AdmissionConfig struct {
+	// Parallelism is the max number of nodes admitted per reconcile batch.
+	// Higher values speed up bootstrap but increase gossip load.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=200
+	// +kubebuilder:default=50
+	// +optional
+	Parallelism int32 `json:"parallelism,omitempty"`
+
+	// MeetStrategy controls how new nodes discover the cluster.
+	// "seed" (default): MEET a small seed set, rely on gossip.
+	// "all": MEET every primary (legacy behavior, expensive at scale).
+	// +kubebuilder:validation:Enum=seed;all
+	// +kubebuilder:default=seed
+	// +optional
+	MeetStrategy string `json:"meetStrategy,omitempty"`
+
+	// SeedCount is the number of existing primaries used as seeds for CLUSTER MEET
+	// when MeetStrategy is "seed". Nodes are selected round-robin across zones.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
+	// +kubebuilder:default=3
+	// +optional
+	SeedCount int32 `json:"seedCount,omitempty"`
+}
+
+// ZoneConfig controls zone-aware placement behavior.
+type ZoneConfig struct {
+	// Enabled activates zone-aware topology spread and PDB creation.
+	// +kubebuilder:default=true
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// TopologyKey is the node label used for zone detection.
+	// +kubebuilder:default="topology.kubernetes.io/zone"
+	// +optional
+	TopologyKey string `json:"topologyKey,omitempty"`
+
+	// MaxSkew is the maximum difference in pod count between zones.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	// +optional
+	MaxSkew int32 `json:"maxSkew,omitempty"`
+}
+
+// MetricsConfig controls the observability pipeline for the ValkeyCluster.
+type MetricsConfig struct {
+	// Enabled activates the metrics sidecar and aggregator deployment.
+	// +kubebuilder:default=true
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// ScrapeIntervalSec is how often the sidecar collects metrics from the Valkey process.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=60
+	// +kubebuilder:default=1
+	// +optional
+	ScrapeIntervalSec int32 `json:"scrapeIntervalSec,omitempty"`
+
+	// AggregatorReplicas is the number of metric aggregator pods.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3
+	// +kubebuilder:default=1
+	// +optional
+	AggregatorReplicas int32 `json:"aggregatorReplicas,omitempty"`
+
+	// HighResolution enables 1-second metric resolution.
+	// When false, uses standard 15s Prometheus scrape interval.
+	// +kubebuilder:default=false
+	// +optional
+	HighResolution bool `json:"highResolution,omitempty"`
 }
 
 // ValkeyClusterStatus defines the observed state of ValkeyCluster.
@@ -128,11 +238,12 @@ type ValkeyClusterStatus struct {
 }
 
 const (
-	ConditionReady         = "Ready"
-	ConditionProgressing   = "Progressing"
-	ConditionDegraded      = "Degraded"
-	ConditionClusterFormed = "ClusterFormed"
-	ConditionSlotsAssigned = "SlotsAssigned"
+	ConditionReady              = "Ready"
+	ConditionProgressing        = "Progressing"
+	ConditionDegraded           = "Degraded"
+	ConditionClusterFormed      = "ClusterFormed"
+	ConditionSlotsAssigned      = "SlotsAssigned"
+	ConditionZoneSpreadDegraded = "ZoneSpreadDegraded"
 )
 
 const (
@@ -154,6 +265,8 @@ const (
 	ReasonSlotsUnassigned   = "SlotsUnassigned"
 	ReasonPrimaryLost       = "PrimaryLost"
 	ReasonNoSlots           = "NoSlotsAvailable"
+	ReasonInsufficientZones = "InsufficientZones"
+	ReasonZoneSpreadOK      = "ZoneSpreadOK"
 )
 
 // +kubebuilder:object:root=true

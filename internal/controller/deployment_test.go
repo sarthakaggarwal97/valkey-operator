@@ -119,6 +119,47 @@ func TestCreateClusterDeployment_SetsNodeSelector(t *testing.T) {
 	assert.Equal(t, nodeSelector, d.Spec.Template.Spec.NodeSelector, "node selector should match spec")
 }
 
+func TestCreateClusterDeployment_InjectsTopologySpreadConstraints(t *testing.T) {
+	cluster := &valkeyv1.ValkeyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "mycluster"},
+		Spec: valkeyv1.ValkeyClusterSpec{
+			Image:    "container:version",
+			Shards:   3,
+			Replicas: 1,
+			ZoneAwareness: &valkeyv1.ZoneConfig{
+				Enabled:     true,
+				TopologyKey: "topology.kubernetes.io/zone",
+				MaxSkew:     1,
+			},
+		},
+	}
+
+	d := createClusterDeployment(cluster, 2, 0)
+
+	tsc := d.Spec.Template.Spec.TopologySpreadConstraints
+	assert.Len(t, tsc, 1, "should have one topology spread constraint")
+	assert.Equal(t, int32(1), tsc[0].MaxSkew)
+	assert.Equal(t, "topology.kubernetes.io/zone", tsc[0].TopologyKey)
+	assert.Equal(t, corev1.DoNotSchedule, tsc[0].WhenUnsatisfiable)
+	assert.Equal(t, "mycluster", tsc[0].LabelSelector.MatchLabels["app.kubernetes.io/instance"])
+	assert.Equal(t, "2", tsc[0].LabelSelector.MatchLabels[LabelShardIndex])
+}
+
+func TestCreateClusterDeployment_NoTopologySpreadWithoutZoneAwareness(t *testing.T) {
+	cluster := &valkeyv1.ValkeyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "mycluster"},
+		Spec: valkeyv1.ValkeyClusterSpec{
+			Image:    "container:version",
+			Shards:   3,
+			Replicas: 1,
+		},
+	}
+
+	d := createClusterDeployment(cluster, 0, 0)
+
+	assert.Empty(t, d.Spec.Template.Spec.TopologySpreadConstraints, "should have no topology spread constraints when zone awareness is not configured")
+}
+
 func TestGenerateContainersDef(t *testing.T) {
 	t.Run("should return only valkey-server when exporter is disabled", func(t *testing.T) {
 		cluster := &valkeyv1.ValkeyCluster{

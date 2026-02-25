@@ -1,0 +1,14 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeyDisruption
+metadata:
+  name: kubecon-resume-50-primaries
+  namespace: valkey-kubecon
+spec:
+  clusterRef: kubecon-2000
+  action: ResumeProcess
+  selector:
+    role: primary
+    shardRange:
+      start: 0
+      end: 49
+    count: 50

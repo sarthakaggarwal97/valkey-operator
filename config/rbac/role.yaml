@@ -20,15 +20,48 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
+  - nodes
   verbs:
   - get
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods/log
+  verbs:
+  - get
+- apiGroups:
   - apps
   resources:
   - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
   verbs:
   - create
   - delete
@@ -45,9 +78,22 @@ rules:
   - create
   - patch
 - apiGroups:
-  - valkey.io
+  - monitoring.coreos.com
   resources:
-  - valkeyclusters
+  - prometheusrules
+  - servicemonitors
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
   verbs:
   - create
   - delete
@@ -59,13 +105,31 @@ rules:
 - apiGroups:
   - valkey.io
   resources:
+  - valkeybenchmarks
+  - valkeyclusters
+  - valkeydisruptions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - valkey.io
+  resources:
+  - valkeybenchmarks/finalizers
   - valkeyclusters/finalizers
+  - valkeydisruptions/finalizers
   verbs:
   - update
 - apiGroups:
   - valkey.io
   resources:
+  - valkeybenchmarks/status
   - valkeyclusters/status
+  - valkeydisruptions/status
   verbs:
   - get
   - patch

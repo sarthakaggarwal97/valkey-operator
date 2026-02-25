@@ -1,0 +1,174 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: valkeybenchmarks.valkey.io
+spec:
+  group: valkey.io
+  names:
+    kind: ValkeyBenchmark
+    listKind: ValkeyBenchmarkList
+    plural: valkeybenchmarks
+    shortNames:
+    - vkb
+    singular: valkeybenchmark
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Benchmark client type
+      jsonPath: .spec.clientType
+      name: ClientType
+      type: string
+    - description: Current execution phase
+      jsonPath: .status.phase
+      name: Phase
+      type: string
+    - description: Aggregate requests per second
+      jsonPath: .status.rps
+      name: RPS
+      type: number
+    - description: Time since creation
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ValkeyBenchmark is the Schema for the valkeybenchmarks API.
+          It provides a declarative API for running benchmark workloads against Valkey clusters.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired benchmark workload
+            properties:
+              clientCount:
+                default: 10
+                description: ClientCount is the number of client pod instances to
+                  launch.
+                format: int32
+                maximum: 1000
+                minimum: 1
+                type: integer
+              clientType:
+                allOf:
+                - enum:
+                  - valkey-benchmark
+                  - valkeypy
+                  - valkeyglide
+                  - iovalkey
+                  - valkeygo
+                  - redisson
+                - enum:
+                  - valkey-benchmark
+                  - valkeypy
+                  - valkeyglide
+                  - iovalkey
+                  - valkeygo
+                  - redisson
+                default: valkey-benchmark
+                description: ClientType is the benchmark client to use.
+                type: string
+              clusterRef:
+                description: ClusterRef is the name of the ValkeyCluster to benchmark.
+                type: string
+              durationSec:
+                default: 300
+                description: DurationSec is how long the benchmark runs in seconds.
+                format: int32
+                minimum: 10
+                type: integer
+              keyDistribution:
+                default: uniform
+                description: |-
+                  KeyDistribution controls how keys are distributed across slots.
+                  "uniform" distributes keys evenly across all 16384 slots using CRC16.
+                  "zipfian" uses a Zipfian distribution for hot-key workloads.
+                enum:
+                - uniform
+                - zipfian
+                type: string
+            required:
+            - clientCount
+            - clientType
+            - clusterRef
+            - durationSec
+            - keyDistribution
+            type: object
+          status:
+            description: status defines the observed state of the benchmark
+            properties:
+              avgLatencyUs:
+                description: |-
+                  AvgLatencyUs is the average latency in microseconds, rounded to the
+                  nearest microsecond.
+                format: int64
+                type: integer
+              completionTime:
+                description: CompletionTime is when the benchmark finished.
+                format: date-time
+                type: string
+              maxDowntimeMs:
+                description: MaxDowntimeMs is the maximum continuous downtime in milliseconds.
+                format: int64
+                type: integer
+              p90LatencyUs:
+                description: |-
+                  P90LatencyUs is the 90th percentile latency in microseconds, rounded to
+                  the nearest microsecond.
+                format: int64
+                type: integer
+              p99LatencyUs:
+                description: |-
+                  P99LatencyUs is the 99th percentile latency in microseconds, rounded to
+                  the nearest microsecond.
+                format: int64
+                type: integer
+              phase:
+                allOf:
+                - enum:
+                  - Running
+                  - Completed
+                  - Failed
+                - enum:
+                  - Running
+                  - Completed
+                  - Failed
+                description: Phase is the current execution phase.
+                type: string
+              rps:
+                description: |-
+                  RPS is the aggregate requests per second (sum across clients), rounded to
+                  the nearest whole request per second.
+                format: int64
+                type: integer
+              startTime:
+                description: StartTime is when the benchmark began.
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

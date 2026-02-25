@@ -116,6 +116,14 @@ func generateContainersDef(cluster *valkeyiov1alpha1.ValkeyCluster) []corev1.Con
 	if cluster.Spec.Exporter.Enabled {
 		containers = append(containers, generateMetricsExporterContainerDef(cluster))
 	}
+
+	// Add metrics sidecar if metrics pipeline is enabled.
+	// This is separate from the legacy exporter above; the sidecar collects
+	// all 14 required metrics via INFO command and /proc inspection.
+	if cluster.Spec.Metrics != nil && cluster.Spec.Metrics.Enabled {
+		containers = append(containers, generateMetricsSidecarContainerDef(cluster))
+	}
+
 	return containers
 }
 
@@ -146,6 +154,9 @@ func createClusterDeployment(cluster *valkeyiov1alpha1.ValkeyCluster, shardIndex
 	nodeLabels[LabelShardIndex] = strconv.Itoa(shardIndex)
 	nodeLabels[LabelNodeIndex] = strconv.Itoa(nodeIndex)
 
+	// Build TopologySpreadConstraints when zone awareness is enabled.
+	topologyConstraints := injectTopologySpreadConstraints(cluster, shardIndex)
+
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      deploymentName(cluster.Name, shardIndex, nodeIndex),
@@ -162,10 +173,11 @@ func createClusterDeployment(cluster *valkeyiov1alpha1.ValkeyCluster, shardIndex
 					Labels: nodeLabels,
 				},
 				Spec: corev1.PodSpec{
-					Containers:   containers,
-					Affinity:     cluster.Spec.Affinity,
-					NodeSelector: cluster.Spec.NodeSelector,
-					Tolerations:  cluster.Spec.Tolerations,
+					Containers:                containers,
+					Affinity:                  cluster.Spec.Affinity,
+					NodeSelector:              cluster.Spec.NodeSelector,
+					Tolerations:               cluster.Spec.Tolerations,
+					TopologySpreadConstraints: topologyConstraints,
 					Volumes: []corev1.Volume{
 						{
 							Name: "scripts",

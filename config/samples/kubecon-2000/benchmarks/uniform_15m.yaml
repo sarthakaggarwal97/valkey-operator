@@ -1,0 +1,11 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeyBenchmark
+metadata:
+  name: kubecon-2000-uniform-15m
+  namespace: valkey-kubecon
+spec:
+  clusterRef: kubecon-2000
+  clientType: valkey-benchmark
+  clientCount: 400
+  durationSec: 900
+  keyDistribution: uniform

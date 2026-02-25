@@ -59,6 +59,39 @@ spec:
           spec:
             description: spec defines the desired state of ValkeyCluster
             properties:
+              admission:
+                description: Admission controls how new nodes are introduced to the
+                  cluster.
+                properties:
+                  meetStrategy:
+                    default: seed
+                    description: |-
+                      MeetStrategy controls how new nodes discover the cluster.
+                      "seed" (default): MEET a small seed set, rely on gossip.
+                      "all": MEET every primary (legacy behavior, expensive at scale).
+                    enum:
+                    - seed
+                    - all
+                    type: string
+                  parallelism:
+                    default: 50
+                    description: |-
+                      Parallelism is the max number of nodes admitted per reconcile batch.
+                      Higher values speed up bootstrap but increase gossip load.
+                    format: int32
+                    maximum: 200
+                    minimum: 1
+                    type: integer
+                  seedCount:
+                    default: 3
+                    description: |-
+                      SeedCount is the number of existing primaries used as seeds for CLUSTER MEET
+                      when MeetStrategy is "seed". Nodes are selected round-robin across zones.
+                    format: int32
+                    maximum: 10
+                    minimum: 1
+                    type: integer
+                type: object
               affinity:
                 description: |-
                   Affinity to apply to the pods, overrides NodeSelector if set
@@ -973,6 +1006,30 @@ spec:
                         x-kubernetes-list-type: atomic
                     type: object
                 type: object
+              clusterConfig:
+                description: |-
+                  ClusterConfig holds tunable Valkey cluster parameters.
+                  If omitted, safe large-scale defaults are applied.
+                properties:
+                  additionalConfig:
+                    description: |-
+                      AdditionalConfig appends raw valkey.conf directives after operator-managed
+                      base directives (port, cluster-enabled, protected-mode, cluster-node-timeout).
+                      Later directives win when duplicated, so this can be used to override base
+                      values for non-production benchmarking.
+                    items:
+                      type: string
+                    type: array
+                  clusterNodeTimeoutMs:
+                    default: 15000
+                    description: |-
+                      ClusterNodeTimeoutMs is the cluster-node-timeout in milliseconds.
+                      At 2000 nodes, the default 2000ms is too aggressive; 15000-30000ms is recommended.
+                    format: int32
+                    maximum: 60000
+                    minimum: 1000
+                    type: integer
+                type: object
               exporter:
                 default:
                   enabled: true
@@ -1048,6 +1105,37 @@ spec:
               image:
                 description: Override the default Valkey image
                 type: string
+              metrics:
+                description: Metrics controls the observability pipeline for the ValkeyCluster.
+                properties:
+                  aggregatorReplicas:
+                    default: 1
+                    description: AggregatorReplicas is the number of metric aggregator
+                      pods.
+                    format: int32
+                    maximum: 3
+                    minimum: 1
+                    type: integer
+                  enabled:
+                    default: true
+                    description: Enabled activates the metrics sidecar and aggregator
+                      deployment.
+                    type: boolean
+                  highResolution:
+                    default: false
+                    description: |-
+                      HighResolution enables 1-second metric resolution.
+                      When false, uses standard 15s Prometheus scrape interval.
+                    type: boolean
+                  scrapeIntervalSec:
+                    default: 1
+                    description: ScrapeIntervalSec is how often the sidecar collects
+                      metrics from the Valkey process.
+                    format: int32
+                    maximum: 60
+                    minimum: 1
+                    type: integer
+                type: object
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -1164,6 +1252,26 @@ spec:
                       type: string
                   type: object
                 type: array
+              zoneAwareness:
+                description: ZoneAwareness controls zone-aware placement behavior.
+                properties:
+                  enabled:
+                    default: true
+                    description: Enabled activates zone-aware topology spread and
+                      PDB creation.
+                    type: boolean
+                  maxSkew:
+                    default: 1
+                    description: MaxSkew is the maximum difference in pod count between
+                      zones.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  topologyKey:
+                    default: topology.kubernetes.io/zone
+                    description: TopologyKey is the node label used for zone detection.
+                    type: string
+                type: object
             type: object
           status:
             default:

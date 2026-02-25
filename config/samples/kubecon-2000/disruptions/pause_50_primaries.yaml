@@ -1,0 +1,16 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeyDisruption
+metadata:
+  name: kubecon-pause-50-primaries
+  namespace: valkey-kubecon
+spec:
+  clusterRef: kubecon-2000
+  action: PauseProcess
+  # Long enough for manual resume during the demo.
+  pauseTimeoutSec: 300
+  selector:
+    role: primary
+    shardRange:
+      start: 0
+      end: 49
+    count: 50

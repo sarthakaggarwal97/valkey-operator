@@ -1,0 +1,16 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeyDisruption
+metadata:
+  name: kubecon-pause-all-primaries
+  namespace: valkey-kubecon
+  annotations:
+    # Required when selector.count=0.
+    valkey.io/confirm-destructive: "true"
+spec:
+  clusterRef: kubecon-2000
+  action: PauseProcess
+  pauseTimeoutSec: 60
+  selector:
+    role: primary
+    # count=0 means "all matching targets".
+    count: 0
