@@ -19,9 +19,12 @@ package valkey
 import (
 	"context"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	vclient "github.com/valkey-io/valkey-go"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -57,6 +60,15 @@ type ClusterState struct {
 // TotalSlots is the number of hash slots in a Valkey cluster (0-16383).
 const TotalSlots = 16384
 
+// perNodeCommandTimeout bounds each Valkey command when scraping node state.
+// This prevents a single slow/unreachable node from stalling reconciliation.
+const perNodeCommandTimeout = 2 * time.Second
+
+// clusterStateWorkers controls parallel node scraping. Bounded concurrency keeps
+// reconcile latency low at large node counts without overwhelming the control
+// plane or target pods.
+const clusterStateWorkers = 64
+
 // SlotsRange is an interval or a single slot when Start and End are equal.
 type SlotsRange struct {
 	Start int
@@ -70,37 +82,71 @@ func GetClusterState(ctx context.Context, addresses []string, port int) *Cluster
 		PendingNodes: make([]*NodeState, 0),
 	}
 
-	for _, address := range addresses {
-		// Attempt to connect to the Valkey node and extract information.
-		node := getNodeState(ctx, address, port)
-		if node != nil {
-			// Check if node is pending to be added.
-			if node.IsPrimary() && len(node.GetSlots()) == 0 {
-				// Node not part of any shard yet.
-				state.PendingNodes = append(state.PendingNodes, node)
-				continue
-			}
+	if len(addresses) == 0 {
+		return &state
+	}
 
-			// Find a ShardState with the same ShardId as this node.
-			var shard *ShardState
-			idx := slices.IndexFunc(state.Shards, func(s *ShardState) bool { return s.Id == node.ShardId })
-			if idx >= 0 {
-				shard = state.Shards[idx]
-			} else {
-				// Not know yet, adding it.
-				shard = &ShardState{
-					Id:    node.ShardId,
-					Nodes: make([]*NodeState, 0),
+	workerCount := min(clusterStateWorkers, len(addresses))
+	jobs := make(chan string)
+	nodes := make(chan *NodeState, len(addresses))
+
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for address := range jobs {
+				node := getNodeState(ctx, address, port)
+				if node != nil {
+					nodes <- node
 				}
-				state.Shards = append(state.Shards, shard)
 			}
-			// Add node and update shard information.
-			shard.Nodes = append(shard.Nodes, node)
-			if node.IsPrimary() {
-				ranges, _ := parseSlotsRanges(node.GetSlots())
-				shard.Slots = ranges
-				shard.PrimaryId = node.Id
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, address := range addresses {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- address:
 			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(nodes)
+	}()
+
+	for node := range nodes {
+		// Check if node is pending to be added.
+		if node.IsPrimary() && len(node.GetSlots()) == 0 {
+			// Node not part of any shard yet.
+			state.PendingNodes = append(state.PendingNodes, node)
+			continue
+		}
+
+		// Find a ShardState with the same ShardId as this node.
+		var shard *ShardState
+		idx := slices.IndexFunc(state.Shards, func(s *ShardState) bool { return s.Id == node.ShardId })
+		if idx >= 0 {
+			shard = state.Shards[idx]
+		} else {
+			// Not know yet, adding it.
+			shard = &ShardState{
+				Id:    node.ShardId,
+				Nodes: make([]*NodeState, 0),
+			}
+			state.Shards = append(state.Shards, shard)
+		}
+		// Add node and update shard information.
+		shard.Nodes = append(shard.Nodes, node)
+		if node.IsPrimary() {
+			ranges, _ := parseSlotsRanges(node.GetSlots())
+			shard.Slots = ranges
+			shard.PrimaryId = node.Id
 		}
 	}
 	return &state
@@ -169,7 +215,16 @@ func (n *NodeState) GetSlots() []string {
 
 // IsPrimary return true if this is a primary node.
 func (n *NodeState) IsPrimary() bool {
-	return slices.Contains(n.Flags, "master")
+	if slices.Contains(n.Flags, "master") {
+		return true
+	}
+	// Fallback for cases where CLUSTER NODES timed out but INFO succeeded.
+	if strings.EqualFold(n.Info["role"], "master") {
+		return true
+	}
+	// Bootstrap fallback: if role/flags are unavailable, treat as primary so
+	// admission can still progress and classify role from pod labels.
+	return len(n.Flags) == 0 && n.Info["role"] == ""
 }
 
 // IsReplicationInSync returns true if this replica node has its replication
@@ -210,6 +265,9 @@ func getNodeState(ctx context.Context, address string, port int) *NodeState {
 	opt := vclient.ClientOption{
 		InitAddress:       []string{fmt.Sprintf("%s:%d", address, port)},
 		ForceSingleClient: true, // Don't connect to another cluster node.
+		Dialer: net.Dialer{
+			Timeout: 500 * time.Millisecond,
+		},
 	}
 
 	client, err := vclient.NewClient(opt)
@@ -222,31 +280,41 @@ func getNodeState(ctx context.Context, address string, port int) *NodeState {
 		Address: address,
 		Port:    port}
 
-	id, err := client.Do(ctx, client.B().ClusterMyid().Build()).ToString()
+	cmdCtx, cancel := context.WithTimeout(ctx, perNodeCommandTimeout)
+	id, err := client.Do(cmdCtx, client.B().ClusterMyid().Build()).ToString()
+	cancel()
 	if err != nil {
 		log.Error(err, "command failed: CLUSTER MYID")
 	}
 	node.Id = id
 
-	shardid, err := client.Do(ctx, client.B().ClusterMyshardid().Build()).ToString()
+	cmdCtx, cancel = context.WithTimeout(ctx, perNodeCommandTimeout)
+	shardid, err := client.Do(cmdCtx, client.B().ClusterMyshardid().Build()).ToString()
+	cancel()
 	if err != nil {
 		log.Error(err, "command failed: CLUSTER MYSHARDID")
 	}
 	node.ShardId = shardid
 
-	info, err := client.Do(ctx, client.B().Info().Build()).ToString()
+	cmdCtx, cancel = context.WithTimeout(ctx, perNodeCommandTimeout)
+	info, err := client.Do(cmdCtx, client.B().Info().Build()).ToString()
+	cancel()
 	if err != nil {
 		log.Error(err, "command failed: INFO")
 	}
 	node.Info = infoStringToMap(info)
 
-	cinfo, err := client.Do(ctx, client.B().ClusterInfo().Build()).ToString()
+	cmdCtx, cancel = context.WithTimeout(ctx, perNodeCommandTimeout)
+	cinfo, err := client.Do(cmdCtx, client.B().ClusterInfo().Build()).ToString()
+	cancel()
 	if err != nil {
 		log.Error(err, "command failed: CLUSTER INFO")
 	}
 	node.ClusterInfo = infoStringToMap(cinfo)
 
-	cnodes, err := client.Do(ctx, client.B().ClusterNodes().Build()).ToString()
+	cmdCtx, cancel = context.WithTimeout(ctx, perNodeCommandTimeout)
+	cnodes, err := client.Do(cmdCtx, client.B().ClusterNodes().Build()).ToString()
+	cancel()
 	if err != nil {
 		log.Error(err, "command failed: CLUSTER NODES")
 	}

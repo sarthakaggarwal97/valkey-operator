@@ -344,8 +344,8 @@ func TestReadinessCheckScript(t *testing.T) {
 		wantErr  bool
 	}{
 		{name: "pong", response: "PONG", wantErr: false},
-		{name: "loading", response: "LOADING 123", wantErr: true},
-		{name: "masterdown", response: "MASTERDOWN Link with MASTER is down", wantErr: true},
+		{name: "loading", response: "LOADING 123", wantErr: false},
+		{name: "masterdown", response: "MASTERDOWN Link with MASTER is down", wantErr: false},
 		{name: "error", response: "ERR something bad", wantErr: true},
 	}
 

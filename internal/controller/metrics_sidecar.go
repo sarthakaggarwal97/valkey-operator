@@ -75,10 +75,10 @@ func generateMetricsSidecarContainerDef(cluster *valkeyiov1alpha1.ValkeyCluster)
 			},
 		},
 		LivenessProbe: &corev1.Probe{
-			InitialDelaySeconds: 10,
-			PeriodSeconds:       10,
-			TimeoutSeconds:      3,
-			FailureThreshold:    3,
+			InitialDelaySeconds: 30,
+			PeriodSeconds:       30,
+			TimeoutSeconds:      10,
+			FailureThreshold:    15,
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
 					Path: "/health",
@@ -87,10 +87,10 @@ func generateMetricsSidecarContainerDef(cluster *valkeyiov1alpha1.ValkeyCluster)
 			},
 		},
 		ReadinessProbe: &corev1.Probe{
-			InitialDelaySeconds: 5,
-			PeriodSeconds:       5,
-			TimeoutSeconds:      3,
-			FailureThreshold:    3,
+			InitialDelaySeconds: 15,
+			PeriodSeconds:       15,
+			TimeoutSeconds:      10,
+			FailureThreshold:    15,
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
 					Path: "/health",

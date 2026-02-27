@@ -39,7 +39,7 @@ const (
 	MetricAggregatorContainerName = "metric-aggregator"
 
 	// MetricAggregatorPortName is the named port for ServiceMonitor discovery.
-	MetricAggregatorPortName = "aggregator-metrics"
+	MetricAggregatorPortName = "agg-metrics"
 )
 
 // metricAggregatorName returns the Deployment name for the metric aggregator.

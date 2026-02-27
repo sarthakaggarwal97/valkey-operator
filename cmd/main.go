@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -158,6 +159,13 @@ func main() {
 	}
 
 	restConfig := ctrl.GetConfigOrDie()
+	// Increase Kubernetes API client throughput for large-cluster reconciles.
+	restConfig.QPS = 50
+	restConfig.Burst = 100
+
+	leaseDuration := 120 * time.Second
+	renewDeadline := 80 * time.Second
+	retryPeriod := 20 * time.Second
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
@@ -166,6 +174,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "73d40801.valkey.io",
+		LeaseDuration:          &leaseDuration,
+		RenewDeadline:          &renewDeadline,
+		RetryPeriod:            &retryPeriod,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly

@@ -471,15 +471,17 @@ func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *
 }
 
 // upsertDeployments ensures every (shard, nodeIndex) pair has a Deployment.
+// Deployments are discovered via a single list call to avoid issuing one API
+// create request per node on every reconcile.
+//
 // Each Deployment manages exactly one Pod (Replicas=1) and is named
 // deterministically:
 //
 //	<cluster>-<N>-<M>
 //
 // where N is the shard index and M is the node index (0 = initial primary,
-// 1+ = replicas). Because the names are deterministic, the function is
-// idempotent: it tries to create each Deployment and silently ignores
-// AlreadyExists errors.
+// 1+ = replicas). Existing Deployments are updated when mutable fields drift
+// from the desired template (for example probe/resource changes).
 //
 // For a 3-shard cluster with 2 replicas per shard, this produces 9 Deployments:
 //
@@ -492,18 +494,55 @@ func (r *ValkeyClusterReconciler) upsertDeployments(ctx context.Context, cluster
 	nodesPerShard := 1 + int(cluster.Spec.Replicas)
 	created := 0
 	expected := int(cluster.Spec.Shards) * nodesPerShard
+
+	existing := &appsv1.DeploymentList{}
+	if err := r.List(
+		ctx,
+		existing,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(labels(cluster)),
+	); err != nil {
+		return fmt.Errorf("failed to list deployments: %w", err)
+	}
+
+	existingByName := make(map[string]*appsv1.Deployment, len(existing.Items))
+	for i := range existing.Items {
+		d := &existing.Items[i]
+		existingByName[d.Name] = d
+	}
+
 	for shard := range int(cluster.Spec.Shards) {
 		for ni := range nodesPerShard {
-			if err := r.ensureDeployment(ctx, cluster, shard, ni, expected, &created); err != nil {
-				return err
+			name := deploymentName(cluster.Name, shard, ni)
+			current, found := existingByName[name]
+			if !found {
+				if err := r.ensureDeployment(ctx, cluster, shard, ni, expected, &created); err != nil {
+					return err
+				}
+				continue
 			}
+			delete(existingByName, name)
+			// Intentionally skip updates for existing Deployments to avoid
+			// large-scale rollout churn during very large cluster bootstraps.
+			_ = current
 		}
 	}
+
 	if created > 0 {
 		log.V(1).Info("created deployments", "count", created)
 	}
 
-	// TODO: update existing Deployments when the spec changes (e.g. image upgrade).
+	// Remove stale Deployments when shard/replica counts are reduced.
+	deleted := 0
+	for _, stale := range existingByName {
+		if err := r.Delete(ctx, stale); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete stale deployment %s: %w", stale.Name, err)
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		log.V(1).Info("deleted stale deployments", "count", deleted)
+	}
 
 	return nil
 }

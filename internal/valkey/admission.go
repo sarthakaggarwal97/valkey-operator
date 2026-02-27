@@ -34,7 +34,7 @@ import (
 const gossipPollInterval = 2 * time.Second
 
 // gossipTimeout is the maximum time to wait for gossip convergence.
-const gossipTimeout = 30 * time.Second
+const gossipTimeout = 180 * time.Second
 
 // gossipPollConcurrency is the max number of parallel gossip polls.
 const gossipPollConcurrency = 10

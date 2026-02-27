@@ -51,10 +51,10 @@ func generateContainersDef(cluster *valkeyiov1alpha1.ValkeyCluster) []corev1.Con
 				},
 			},
 			StartupProbe: &corev1.Probe{
-				InitialDelaySeconds: 5,
-				PeriodSeconds:       5,
-				FailureThreshold:    20,
-				TimeoutSeconds:      5,
+				InitialDelaySeconds: 10,
+				PeriodSeconds:       10,
+				FailureThreshold:    30,
+				TimeoutSeconds:      10,
 				SuccessThreshold:    1,
 				ProbeHandler: corev1.ProbeHandler{
 					Exec: &corev1.ExecAction{
@@ -67,10 +67,10 @@ func generateContainersDef(cluster *valkeyiov1alpha1.ValkeyCluster) []corev1.Con
 				},
 			},
 			LivenessProbe: &corev1.Probe{
-				InitialDelaySeconds: 5,
-				PeriodSeconds:       5,
-				FailureThreshold:    5,
-				TimeoutSeconds:      5,
+				InitialDelaySeconds: 10,
+				PeriodSeconds:       15,
+				FailureThreshold:    10,
+				TimeoutSeconds:      10,
 				SuccessThreshold:    1,
 				ProbeHandler: corev1.ProbeHandler{
 					Exec: &corev1.ExecAction{
@@ -83,10 +83,10 @@ func generateContainersDef(cluster *valkeyiov1alpha1.ValkeyCluster) []corev1.Con
 				},
 			},
 			ReadinessProbe: &corev1.Probe{
-				InitialDelaySeconds: 5,
-				PeriodSeconds:       5,
-				FailureThreshold:    5,
-				TimeoutSeconds:      2,
+				InitialDelaySeconds: 10,
+				PeriodSeconds:       10,
+				FailureThreshold:    10,
+				TimeoutSeconds:      10,
 				SuccessThreshold:    1,
 				ProbeHandler: corev1.ProbeHandler{
 					Exec: &corev1.ExecAction{
